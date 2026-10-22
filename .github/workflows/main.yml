@@ -1,0 +1,29 @@
+
+name: Asahi ARM64 Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify ARM64 runner
+        run: |
+          uname -m
+          lscpu
+          df -h
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build Asahi packages
+        run: |
+          nix build -L .#linux-asahi
+          nix build -L .#uboot-asahi
