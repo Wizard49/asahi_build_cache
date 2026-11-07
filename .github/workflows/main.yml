@@ -1,29 +1,132 @@
-
-name: Asahi ARM64 Build
+name: Asahi VA-API driver ARM64 build
 
 on:
+  schedule:
+    # GitHub cannot subscribe to pushes in an unrelated repository.
+    # Check the upstream default branch twice per hour (UTC).
+    - cron: "17,47 * * * *"
+  workflow_dispatch:
   push:
     branches: [main]
-  workflow_dispatch:
+    paths:
+      - .github/workflows/main.yml
+
+concurrency:
+  group: asahi-va-driver-build
+  cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: ubuntu-24.04-arm
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.upstream.outputs.changed }}
+      revision: ${{ steps.upstream.outputs.revision }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout build cache
         uses: actions/checkout@v4
 
-      - name: Verify ARM64 runner
+      - name: Check Asahi driver revision
+        id: upstream
+        shell: bash
         run: |
-          uname -m
-          lscpu
-          df -h
+          set -euo pipefail
+          revision="$(git ls-remote https://github.com/AsahiLinux/asahi-va-driver.git refs/heads/master | awk '{print $1}')"
+          test -n "$revision"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
+          previous="$(cat artifacts/upstream-revision.txt 2>/dev/null || true)"
+          if [[ "$revision" != "$previous" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Build required: ${previous:-none} -> $revision"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream unchanged: $revision"
+          fi
 
-      - name: Build Asahi packages
+  build:
+    needs: check
+    if: ${{ needs.check.outputs.changed == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout exact upstream revision
+        uses: actions/checkout@v4
+        with:
+          repository: AsahiLinux/asahi-va-driver
+          ref: ${{ needs.check.outputs.revision }}
+          persist-credentials: false
+
+      - name: Install build dependencies
         run: |
-          nix build -L .#linux-asahi
-          nix build -L .#uboot-asahi
+          sudo apt-get update
+          sudo apt-get install -y build-essential meson ninja-build pkg-config libva-dev libdrm-dev linux-libc-dev file
+
+      - name: Compile Asahi VA-API driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "aarch64"
+          meson setup build
+          meson compile -C build
+          file build/asahi_drv_video.so
+          test -s build/asahi_drv_video.so
+
+      - name: Package binary and source revision
+        shell: bash
+        env:
+          DRIVER_REVISION: ${{ needs.check.outputs.revision }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          install -m 755 build/asahi_drv_video.so dist/asahi_drv_video.so
+          printf '%s\n' "$DRIVER_REVISION" > dist/upstream-revision.txt
+          (cd dist && sha256sum asahi_drv_video.so > SHA256SUMS)
+
+      - name: Transfer compiled output to publishing job
+        uses: actions/upload-artifact@v4
+        with:
+          name: asahi-va-driver-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: [check, build]
+    if: ${{ needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout cache repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download compiled driver
+        uses: actions/download-artifact@v4
+        with:
+          name: asahi-va-driver-arm64
+          path: artifacts/
+
+      - name: Commit the binary to the repository
+        shell: bash
+        env:
+          DRIVER_REVISION: ${{ needs.check.outputs.revision }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          chmod 755 artifacts/asahi_drv_video.so
+          git add artifacts/asahi_drv_video.so artifacts/upstream-revision.txt artifacts/SHA256SUMS
+          if git diff --cached --quiet; then
+            echo "No artifact changes to commit."
+            exit 0
+          fi
+          git commit -m "build: update Asahi ARM64 driver (${DRIVER_REVISION:0:12})"
+          git push origin HEAD:main
